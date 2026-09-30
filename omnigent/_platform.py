@@ -186,6 +186,53 @@ WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
 )
 
 
+def _is_wsl_bash_launcher(path: str) -> bool:
+    """Return whether *path* is Windows' ``bash.exe`` launcher for WSL.
+
+    ``%SystemRoot%\\System32\\bash.exe`` and the ``WindowsApps`` alias run
+    commands inside a Linux distro, not against the Windows checkout.
+
+    :param path: Resolved executable path, e.g. ``"C:\\Windows\\System32\\bash.exe"``.
+    :returns: ``True`` for the WSL launcher locations.
+    """
+    lowered = os.path.normcase(os.path.abspath(path))
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    system32 = os.path.normcase(os.path.join(system_root, "System32"))
+    return lowered.startswith(system32 + os.sep) or f"{os.sep}windowsapps{os.sep}" in lowered
+
+
+def windows_posix_shell() -> str | None:
+    """Locate Git for Windows' ``bash.exe``, never the WSL launcher.
+
+    Checks ``bash`` on ``PATH`` first, then the ``bin`` dir next to the
+    ``git`` on ``PATH`` (Git installs ``cmd\\git.exe`` beside ``bin\\bash.exe``),
+    then the standard per-machine and per-user install locations.
+
+    :returns: Absolute path to Git Bash, or ``None`` when none is installed.
+    """
+    import shutil
+
+    candidates: list[str] = []
+    on_path = shutil.which("bash")
+    if on_path:
+        candidates.append(on_path)
+    git = shutil.which("git")
+    if git:
+        git_root = os.path.dirname(os.path.dirname(os.path.abspath(git)))
+        candidates.append(os.path.join(git_root, "bin", "bash.exe"))
+    for base in (
+        os.environ.get("ProgramFiles"),
+        os.environ.get("ProgramW6432"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
+    ):
+        if base:
+            candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
+    for candidate in candidates:
+        if os.path.isfile(candidate) and not _is_wsl_bash_launcher(candidate):
+            return candidate
+    return None
+
+
 def default_shell_argv(command: str) -> list[str]:
     """
     Build the argv to run ``command`` through the host's default shell.

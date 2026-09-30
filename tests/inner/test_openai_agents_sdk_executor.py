@@ -2202,7 +2202,7 @@ def test_run_turn_generic_error_redacts_cause_from_user_message(monkeypatch, cap
     import io
     import logging
 
-    secret = "dapiSYNTHETIC123456789"
+    secret = "fake-bearer-token-0123456789abcdef"
     cause = ValueError(f"Illegal header value b'Bearer {secret}'")
     outer = RuntimeError("Connection error.")
     outer.__cause__ = cause
@@ -3361,3 +3361,122 @@ def test_no_compaction_item_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+def test_gateway_turn_without_sh_reports_the_auth_failure(monkeypatch, tmp_path):
+    """A gateway turn on a host with no ``sh`` must name the auth failure.
+
+    The bearer-token hook launches the ucode auth command through ``sh``;
+    native Windows has none, and the OpenAI SDK wraps the resulting
+    ``FileNotFoundError`` into an opaque ``APIConnectionError``. The turn
+    may still fail, but not as "Connection error.".
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Empty directory used as the entire ``PATH``.
+    """
+    import json
+    import subprocess
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from omnigent.spec.types import RetryPolicy
+
+    class _RejectToken(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.dumps({"error": {"message": "bad token"}}).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    gateway = ThreadingHTTPServer(("127.0.0.1", 0), _RejectToken)
+    threading.Thread(target=gateway.serve_forever, daemon=True).start()
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["sh", "-c", "true"], check=False)
+
+    executor = OpenAIAgentsSDKExecutor(
+        model="databricks-gpt-6-astra",
+        gateway_host=f"http://127.0.0.1:{gateway.server_port}",
+        base_url_override=f"http://127.0.0.1:{gateway.server_port}/v1",
+        gateway_auth_command="printf %s mock-token",
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+    try:
+        events = _run(
+            _collect(
+                executor.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    config=ExecutorConfig(),
+                )
+            )
+        )
+        _run(executor.close())
+    finally:
+        gateway.shutdown()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, f"expected the turn to report its failure, got {events!r}"
+    for error in errors:
+        assert "Connection error." not in error.message, (
+            f"the missing `sh` surfaced as the SDK's opaque connection error: {error.message!r}"
+        )
+        assert "sh" in error.message or "token" in error.message.lower(), error.message
+
+
+def _shell_auth_flow(command: str):
+    """Start the shell bearer hook's auth flow for one request.
+
+    :param command: Shell command the hook runs to print a token.
+    :returns: The ``auth_flow`` generator, positioned before its first step.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _ShellCommandBearerAuth
+
+    request = httpx.Request("POST", "http://gateway.test/v1/responses")
+    return _ShellCommandBearerAuth(command).auth_flow(request)
+
+
+def test_shell_command_bearer_auth_sets_bearer_header():
+    """A command that prints a token yields the request with that bearer."""
+    request = next(_shell_auth_flow("printf %s minted-token"))
+
+    assert request.headers["Authorization"] == "Bearer minted-token"
+
+
+def test_shell_command_bearer_auth_reports_missing_sh(monkeypatch, tmp_path):
+    """Without ``sh`` on PATH the hook raises the auth error the executor surfaces.
+
+    A raw ``FileNotFoundError`` would be collapsed by the OpenAI SDK into
+    ``APIConnectionError("Connection error.")``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Empty directory used as the entire ``PATH``.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(DatabricksAuthError, match="`sh`"):
+        next(_shell_auth_flow("printf %s minted-token"))
+
+
+def test_shell_command_bearer_auth_reports_failed_command(caplog):
+    """A failing auth command raises the surfaced auth error and logs its stderr.
+
+    :param caplog: Pytest log capture fixture.
+    """
+    import logging
+
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.openai_agents_sdk_executor"):
+        with pytest.raises(DatabricksAuthError, match=r"exit 3"):
+            next(_shell_auth_flow("echo 'no cached OAuth token' >&2; exit 3"))
+
+    assert "no cached OAuth token" in caplog.text

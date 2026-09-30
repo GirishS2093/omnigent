@@ -17,6 +17,7 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
 import traceback
@@ -653,17 +654,35 @@ class _ShellCommandBearerAuth(httpx.Auth):
 
         :param request: The outgoing httpx request.
         :yields: The request with the auth header set.
-        :raises RuntimeError: When the command fails or prints no token.
+        :raises DatabricksAuthError: When ``sh`` is not on PATH or the command
+            fails or prints no token. Any other exception raised here is
+            collapsed by the OpenAI SDK into an opaque ``APIConnectionError``.
         """
+        from .databricks_executor import DatabricksAuthError
+
+        sh = shutil.which("sh")
+        if sh is None:
+            raise DatabricksAuthError(
+                "Databricks gateway auth command needs `sh` on PATH to mint a gateway "
+                "token, but no `sh` was found. Install a POSIX shell or add it to PATH."
+            )
         result = subprocess.run(
-            ["sh", "-c", self._command],
+            [sh, "-c", self._command],
             check=False,
             capture_output=True,
             text=True,
         )
         token = result.stdout.strip()
         if result.returncode != 0 or not token:
-            raise RuntimeError("Databricks auth command failed to return a bearer token.")
+            logger.error(
+                "Databricks gateway auth command failed (exit %d): %s",
+                result.returncode,
+                redact_log_text(result.stderr.strip()) or "<no stderr>",
+            )
+            raise DatabricksAuthError(
+                "Databricks gateway auth command failed to return a gateway token "
+                f"(exit {result.returncode}); its error output is in the harness log."
+            )
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 

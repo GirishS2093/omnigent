@@ -186,49 +186,61 @@ WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
 )
 
 
+#: Directories holding Windows' own ``bash.exe`` — the launcher that boots the
+#: default WSL distro instead of running commands on the Windows host:
+#: ``%SystemRoot%\System32`` (``Sysnative`` under WoW64) and the Store alias
+#: under ``%LocalAppData%\Microsoft\WindowsApps``.
+_WSL_LAUNCHER_DIRS = frozenset({"system32", "sysnative", "windowsapps"})
+
+
 def _is_wsl_bash_launcher(path: str) -> bool:
     """Return whether *path* is Windows' ``bash.exe`` launcher for WSL.
 
-    ``%SystemRoot%\\System32\\bash.exe`` and the ``WindowsApps`` alias run
-    commands inside a Linux distro, not against the Windows checkout.
+    Recognised by location alone (:data:`_WSL_LAUNCHER_DIRS`), so the check does
+    not depend on ``SystemRoot`` being set or on how it is spelled.
 
-    :param path: Resolved executable path, e.g. ``"C:\\Windows\\System32\\bash.exe"``.
+    :param path: Executable path, e.g. ``"C:\\Windows\\System32\\bash.exe"``.
     :returns: ``True`` for the WSL launcher locations.
     """
-    lowered = os.path.normcase(os.path.abspath(path))
-    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
-    system32 = os.path.normcase(os.path.join(system_root, "System32"))
-    return lowered.startswith(system32 + os.sep) or f"{os.sep}windowsapps{os.sep}" in lowered
+    candidate = Path(path)
+    return (
+        candidate.name.lower() in ("bash", "bash.exe")
+        and candidate.parent.name.lower() in _WSL_LAUNCHER_DIRS
+    )
 
 
 def windows_posix_shell() -> str | None:
-    """Locate Git for Windows' ``bash.exe``, never the WSL launcher.
+    """Locate a POSIX shell for a Windows host, never the WSL launcher.
 
-    Checks ``bash`` on ``PATH`` first, then the ``bin`` dir next to the
-    ``git`` on ``PATH`` (Git installs ``cmd\\git.exe`` beside ``bin\\bash.exe``),
-    then the standard per-machine and per-user install locations.
+    Walks every ``bash`` on ``PATH`` in order, skipping the WSL launcher, so a
+    Git for Windows, MSYS2, or Cygwin bash further down ``PATH`` still wins.
+    Otherwise falls back to Git for Windows' ``bin\\bash.exe`` — beside the
+    ``git`` on ``PATH`` first (Git installs ``cmd\\git.exe`` next to it), then
+    the standard per-machine and per-user install locations — because a
+    PowerShell-started host usually has Git's ``cmd`` dir on ``PATH`` but not
+    its ``usr\\bin``.
 
-    :returns: Absolute path to Git Bash, or ``None`` when none is installed.
+    :returns: Absolute path to a usable bash, or ``None`` when none is installed.
     """
-    import shutil
+    for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        found = shutil.which("bash", path=directory) if directory else None
+        if found is not None and not _is_wsl_bash_launcher(found):
+            return found
 
-    candidates: list[str] = []
-    on_path = shutil.which("bash")
-    if on_path:
-        candidates.append(on_path)
+    git_roots: list[str] = []
     git = shutil.which("git")
     if git:
-        git_root = os.path.dirname(os.path.dirname(os.path.abspath(git)))
-        candidates.append(os.path.join(git_root, "bin", "bash.exe"))
-    for base in (
-        os.environ.get("ProgramFiles"),
-        os.environ.get("ProgramW6432"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs"),
-    ):
-        if base:
-            candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
-    for candidate in candidates:
-        if os.path.isfile(candidate) and not _is_wsl_bash_launcher(candidate):
+        git_roots.append(os.path.dirname(os.path.dirname(os.path.abspath(git))))
+    install_bases = [
+        os.environ.get(var) for var in ("PROGRAMFILES", "PROGRAMW6432", "PROGRAMFILES(X86)")
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        install_bases.append(os.path.join(local_app_data, "Programs"))
+    git_roots.extend(os.path.join(base, "Git") for base in install_bases if base)
+    for root in git_roots:
+        candidate = os.path.join(root, "bin", "bash.exe")
+        if os.path.isfile(candidate):
             return candidate
     return None
 

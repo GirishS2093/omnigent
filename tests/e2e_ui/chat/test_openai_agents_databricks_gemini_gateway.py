@@ -12,7 +12,7 @@ its profile at a differently configured gateway origin:
 - ``mlflow-lenient``: the same surface without the thought-signature check, so the
   tool loop caused by ``id == function name`` tool calls is reachable.
 
-The fake ``~/.databrickscfg`` profiles and ucode state live in a scratch ``HOME``
+The fake Databricks CLI profiles and ucode state live in a scratch ``HOME``
 that only a dedicated runner (spawned here against the shared server) sees, so the
 developer's own Databricks and ucode configuration is never read or written.
 """

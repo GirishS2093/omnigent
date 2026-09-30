@@ -473,10 +473,12 @@ def test_create_os_environment_skips_wsl_launcher_bash_on_windows(
 
     :returns: None.
     """
+    from omnigent import _platform
     from omnigent.inner import os_env as os_env_module
 
     system32, git_usr_bin = _windows_like_tree(tmp_path)
     git_cmd = tmp_path / "Program Files" / "Git" / "cmd"
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
     monkeypatch.setattr(os_env_module, "IS_WINDOWS", True)
     monkeypatch.setenv("PATH", os.pathsep.join([str(system32), str(git_cmd)]))
     # Spelled as Windows stores them: ``os.environ`` keys are uppercased there.
@@ -509,6 +511,7 @@ def test_create_os_environment_falls_back_to_comspec_without_posix_shell_on_wind
 
     :returns: None.
     """
+    from omnigent import _platform
     from omnigent.inner import os_env as os_env_module
 
     system32 = tmp_path / "Windows" / "System32"
@@ -516,6 +519,7 @@ def test_create_os_environment_falls_back_to_comspec_without_posix_shell_on_wind
     for exe in (system32 / "bash", system32 / "bash.exe", system32 / "cmd.exe"):
         exe.write_text("#!/bin/sh\n")
         exe.chmod(0o755)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
     monkeypatch.setattr(os_env_module, "IS_WINDOWS", True)
     monkeypatch.setenv("PATH", str(system32))
     monkeypatch.setenv("COMSPEC", str(system32 / "cmd.exe"))

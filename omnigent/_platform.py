@@ -196,8 +196,9 @@ _WSL_LAUNCHER_DIRS = frozenset({"system32", "sysnative", "windowsapps"})
 def _is_wsl_bash_launcher(path: str) -> bool:
     """Return whether *path* is Windows' ``bash.exe`` launcher for WSL.
 
-    Recognised by location alone (:data:`_WSL_LAUNCHER_DIRS`), so the check does
-    not depend on ``SystemRoot`` being set or on how it is spelled.
+    Recognised by location alone (:data:`_WSL_LAUNCHER_DIRS`), so the check
+    depends neither on the host OS nor on ``SystemRoot`` being set; no POSIX
+    ``PATH`` carries a bash under those directories, so it is a no-op there.
 
     :param path: Executable path, e.g. ``"C:\\Windows\\System32\\bash.exe"``.
     :returns: ``True`` for the WSL launcher locations.
@@ -209,24 +210,22 @@ def _is_wsl_bash_launcher(path: str) -> bool:
     )
 
 
-def windows_posix_shell() -> str | None:
-    """Locate a POSIX shell for a Windows host, never the WSL launcher.
-
-    Walks every ``bash`` on ``PATH`` in order, skipping the WSL launcher, so a
-    Git for Windows, MSYS2, or Cygwin bash further down ``PATH`` still wins.
-    Otherwise falls back to Git for Windows' ``bin\\bash.exe`` — beside the
-    ``git`` on ``PATH`` first (Git installs ``cmd\\git.exe`` next to it), then
-    the standard per-machine and per-user install locations — because a
-    PowerShell-started host usually has Git's ``cmd`` dir on ``PATH`` but not
-    its ``usr\\bin``.
-
-    :returns: Absolute path to a usable bash, or ``None`` when none is installed.
-    """
+def _shell_on_path(name: str) -> str | None:
+    """Return the first ``name`` on ``PATH`` that is not the WSL launcher."""
     for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
-        found = shutil.which("bash", path=directory) if directory else None
+        found = shutil.which(name, path=directory) if directory else None
         if found is not None and not _is_wsl_bash_launcher(found):
             return found
+    return None
 
+
+def _git_for_windows_bash() -> str | None:
+    """Return Git for Windows' ``bin\\bash.exe``, or ``None`` when Git is absent.
+
+    Looks beside the ``git`` on ``PATH`` first (Git installs ``cmd\\git.exe``
+    next to ``bin\\bash.exe``), then in the standard per-machine and per-user
+    install locations. The env keys are spelled as Windows stores them.
+    """
     git_roots: list[str] = []
     git = shutil.which("git")
     if git:
@@ -243,6 +242,27 @@ def windows_posix_shell() -> str | None:
         if os.path.isfile(candidate):
             return candidate
     return None
+
+
+def posix_shell_path() -> str | None:
+    """Locate the POSIX shell that runs agent commands on this host.
+
+    Takes the first ``bash`` on ``PATH`` that is not the WSL launcher, so a Git
+    for Windows, MSYS2, or Cygwin bash behind the launcher still wins. On
+    Windows it then probes Git for Windows' bash, because a PowerShell-started
+    host usually has Git's ``cmd`` dir on ``PATH`` but not its ``usr\\bin``.
+    Falls back to ``sh``.
+
+    :returns: Absolute path to the shell, or ``None`` when none is installed.
+    """
+    bash = _shell_on_path("bash")
+    if bash is not None:
+        return bash
+    if IS_WINDOWS:
+        git_bash = _git_for_windows_bash()
+        if git_bash is not None:
+            return git_bash
+    return _shell_on_path("sh")
 
 
 def default_shell_argv(command: str) -> list[str]:

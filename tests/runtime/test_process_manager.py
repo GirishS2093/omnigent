@@ -267,3 +267,31 @@ def test_build_harness_spawn_env_keeps_desktop_session_in_runner(
     assert {name: overrides[name] for name in session_env} == session_env
     if with_overrides:
         assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s test-key"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, 30.0),
+        ("120", 120.0),
+        ("2.5", 2.5),
+        ("0", 30.0),
+        ("-5", 30.0),
+        ("inf", 30.0),
+        ("nan", 30.0),
+        ("soon", 30.0),
+    ],
+)
+def test_spawn_ready_timeout_honours_positive_env_override(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    """Slow hosts can raise the spawn deadline; bad values keep the default."""
+    from omnigent.runtime.harnesses import process_manager as pm
+
+    monkeypatch.setattr(pm, "_SPAWN_READY_TIMEOUT_S", 30.0)
+    if raw is None:
+        monkeypatch.delenv(pm.SPAWN_READY_TIMEOUT_ENV_VAR, raising=False)
+    else:
+        monkeypatch.setenv(pm.SPAWN_READY_TIMEOUT_ENV_VAR, raw)
+
+    assert pm._spawn_ready_timeout_s() == expected

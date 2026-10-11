@@ -344,7 +344,8 @@ async def _wait_for_bind(
             raise RuntimeError(
                 f"harness {harness!r} for conversation "
                 f"{conversation_id!r} did not bind its endpoint "
-                f"within {timeout_s:.0f}s (raise {SPAWN_READY_TIMEOUT_ENV_VAR} on slow hosts)"
+                f"within {timeout_s:g}s (on slow hosts, set "
+                f"{SPAWN_READY_TIMEOUT_ENV_VAR} higher and restart the host)"
             )
         await asyncio.sleep(_SPAWN_POLL_INTERVAL_S)
 

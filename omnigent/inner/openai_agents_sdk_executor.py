@@ -26,6 +26,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
+from omnigent.databricks_ai_gateway import model_provider_service_headers
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
@@ -482,6 +483,7 @@ def _get_openai_async_client(
             base_url=base_url_override,
             api_key=_OPENAI_KEY_PLACEHOLDER,
             http_client=httpx.AsyncClient(auth=_ShellCommandBearerAuth(databricks_auth_command)),
+            default_headers=model_provider_service_headers(),
             **retry_kwargs,
         )
 
@@ -526,6 +528,7 @@ def _get_openai_async_client(
                 base_url=base_url_override or _databricks_openai_base_url(host),
                 api_key=_OPENAI_KEY_PLACEHOLDER,
                 http_client=httpx.AsyncClient(auth=auth),
+                default_headers=model_provider_service_headers(),
                 **retry_kwargs,
             )
         except DatabricksAuthError as exc:
@@ -590,6 +593,7 @@ def _get_openai_async_client(
         base_url=base_url_override or _databricks_openai_base_url(host),
         api_key=_OPENAI_KEY_PLACEHOLDER,
         http_client=httpx.AsyncClient(auth=auth),
+        default_headers=model_provider_service_headers(),
         **retry_kwargs,
     )
 

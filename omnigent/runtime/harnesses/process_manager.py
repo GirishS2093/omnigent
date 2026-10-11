@@ -164,9 +164,6 @@ _RELEASE_GRACE_S = 5.0
 # forever.
 _SPAWN_READY_TIMEOUT_S = 30.0
 
-# Operator override for hosts where process start is slow (e.g. endpoint
-# security scanning each Python extension on load). Non-positive,
-# non-finite or unparsable values keep the default.
 SPAWN_READY_TIMEOUT_ENV_VAR = "OMNIGENT_HARNESS_SPAWN_TIMEOUT_S"
 
 

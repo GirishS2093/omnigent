@@ -111,7 +111,10 @@ Omnigent sends the `Databricks-Model-Provider-Service` header on every gateway
 request. Match the harness to the model's API type on the provider page:
 `claude-sdk` for `anthropic/v1/messages`, `openai-agents` for
 `openai/v1/responses` (add `use_responses: false` for chat-completions-only
-models). Other harnesses reject the setting.
+models). Other harnesses reject the setting. A Databricks-hosted model override
+(e.g. `databricks-claude-sonnet-5` from `/model` or a sub-agent dispatch) is
+ignored for such an agent, which keeps its provider model, and background
+session titles use the agent's model rather than the economy-tier alias.
 
 ### Antigravity (Gemini)
 

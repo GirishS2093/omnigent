@@ -146,3 +146,58 @@ def test_runner_rejects_a_malformed_provider_service() -> None:
         _build_spawn_env_from_spec(
             _spec({"harness": "claude-sdk", "model_provider_service": "a.b\nX: y"}), "claude-sdk"
         )
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("databricks-claude-sonnet-5", True),
+        ("system.ai.gpt-6-luna", True),
+        ("databricks/databricks-claude-opus-5-5", True),
+        ("us.anthropic.claude-sonnet-5", False),
+        ("gpt-6-astra", False),
+    ],
+)
+def test_databricks_catalog_model_detection(model: str, expected: bool) -> None:
+    from omnigent.databricks_ai_gateway import is_databricks_catalog_model
+
+    assert is_databricks_catalog_model(model) is expected
+
+
+def _env_with_override(config: dict[str, str], model_override: str) -> dict[str, str]:
+    from omnigent.runner.app import _build_spawn_env_from_spec
+
+    with inference_config_scope({}):
+        env = _build_spawn_env_from_spec(
+            _spec(config), "claude-sdk", model_override=model_override
+        )
+    assert env is not None
+    return env
+
+
+@pytest.mark.parametrize("override", ["databricks-claude-sonnet-5", "system.ai.claude-sonnet-5"])
+def test_provider_pinned_agent_ignores_a_databricks_hosted_override(override: str) -> None:
+    """The provider cannot serve a Databricks-hosted id; the agent keeps its provider model."""
+    env = _env_with_override(
+        {"harness": "claude-sdk", "model_provider_service": _BEDROCK}, override
+    )
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "us.anthropic.claude-sonnet-5"
+    assert env[MODEL_PROVIDER_SERVICE_ENV_VAR] == _BEDROCK
+
+
+def test_provider_pinned_agent_accepts_a_provider_model_override() -> None:
+    env = _env_with_override(
+        {"harness": "claude-sdk", "model_provider_service": _BEDROCK},
+        "us.anthropic.claude-opus-5-5",
+    )
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "us.anthropic.claude-opus-5-5"
+    assert env[MODEL_PROVIDER_SERVICE_ENV_VAR] == _BEDROCK
+
+
+def test_unpinned_agent_still_takes_a_databricks_hosted_override() -> None:
+    env = _env_with_override({"harness": "claude-sdk"}, "databricks-claude-opus-5-5")
+
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-opus-5-5"
+    assert MODEL_PROVIDER_SERVICE_ENV_VAR not in env

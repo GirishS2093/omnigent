@@ -8135,7 +8135,23 @@ def _build_spawn_env_from_spec(
     if model_override and env is not None:
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
-            env[model_key] = model_override
+            if provider_service:
+                from omnigent.databricks_ai_gateway import is_databricks_catalog_model
+
+                if is_databricks_catalog_model(model_override):
+                    # An agent pinned to a provider service keeps its own provider
+                    # model: the provider cannot serve a Databricks-hosted id, and
+                    # sending one with its header fails the turn (``NOT_FOUND``).
+                    _logger.warning(
+                        "ignoring model override %s: agent is pinned to model provider "
+                        "service %s, which does not serve Databricks-hosted models",
+                        model_override,
+                        provider_service,
+                        extra={"session_id": session_id},
+                    )
+                    model_override = None
+            if model_override:
+                env[model_key] = model_override
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /

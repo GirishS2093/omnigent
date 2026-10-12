@@ -104,6 +104,9 @@ MODEL_PROVIDER_SERVICE_ENV_VAR: Final = "HARNESS_DATABRICKS_MODEL_PROVIDER_SERVI
 # Harnesses that send the provider-service header on their gateway requests.
 MODEL_PROVIDER_SERVICE_HARNESSES: Final = frozenset({"claude-sdk", "openai-agents"})
 
+# Prefixes the Databricks catalog puts on the models it serves itself.
+_DATABRICKS_MODEL_PREFIXES: Final = ("databricks/", "system.ai.", "databricks-")
+
 # Three-part Unity Catalog name, e.g. ``main.ai.bedrock_prod``.
 # Restricted to safe identifier characters because the value is sent as an HTTP
 # header (and joined into Claude Code's newline-separated header list).
@@ -139,3 +142,13 @@ def model_provider_service_headers() -> dict[str, str]:
     if not raw.strip():
         return {}
     return {MODEL_PROVIDER_SERVICE_HEADER: validate_model_provider_service(raw)}
+
+
+def is_databricks_catalog_model(model: str) -> bool:
+    """Return whether *model* is a Databricks-served id, which no provider service serves.
+
+    :param model: A model id, e.g. ``"databricks-claude-sonnet-5"`` (``True``) or
+        ``"us.anthropic.claude-sonnet-5"`` (``False``).
+    :returns: ``True`` when *model* carries a Databricks catalog prefix.
+    """
+    return model.strip().lower().startswith(_DATABRICKS_MODEL_PREFIXES)

@@ -348,9 +348,13 @@ def _use_fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
     async def _sleep(delay: float) -> None:
         clock.now += delay
 
-    monkeypatch.setattr(
-        pm, "asyncio", SimpleNamespace(get_running_loop=lambda: clock, sleep=_sleep)
-    )
+    # A module-local copy of asyncio with only the clock swapped: every other
+    # asyncio name stays real, and the test runner's own loop is untouched (patching
+    # the shared asyncio module would replace sleep/get_running_loop process-wide).
+    fake_asyncio = SimpleNamespace(**vars(pm.asyncio))
+    fake_asyncio.get_running_loop = lambda: clock
+    fake_asyncio.sleep = _sleep
+    monkeypatch.setattr(pm, "asyncio", fake_asyncio)
     monkeypatch.setattr(pm, "_SPAWN_READY_TIMEOUT_S", 30.0)
     return clock
 

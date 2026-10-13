@@ -543,9 +543,10 @@ def _get_openai_async_client(
     # every turn even when the override is lost. base_url=None still defaults
     # to api.openai.com for a genuine OpenAI key with no gateway configured.
     if api_key and api_key.strip():
+        base_url = base_url_override or os.environ.get("OPENAI_BASE_URL")
         return AsyncOpenAI(
             api_key=api_key,
-            base_url=base_url_override or os.environ.get("OPENAI_BASE_URL") or None,
+            base_url=_gateway_base_url_for_model(base_url, model) if base_url else None,
             **retry_kwargs,
         )
 
@@ -596,7 +597,7 @@ def _get_openai_async_client(
 
     if os.environ.get("OPENAI_BASE_URL"):
         return AsyncOpenAI(
-            base_url=os.environ["OPENAI_BASE_URL"],
+            base_url=_gateway_base_url_for_model(os.environ["OPENAI_BASE_URL"], model),
             api_key=os.environ.get("OPENAI_API_KEY", _OPENAI_KEY_PLACEHOLDER),
             **retry_kwargs,
         )
@@ -703,7 +704,9 @@ def _gateway_thought_signature_messages(messages: object) -> object:
     return rewritten
 
 
-def _expose_google_thought_signatures(message: object) -> None:
+def _expose_google_thought_signatures(
+    message: object, call_ids: dict[int, str] | None = None
+) -> None:
     """Adapt gateway Gemini tool calls for the Agents SDK, in place.
 
     Mirrors the gateway's ``thoughtSignature`` into the SDK's Google field, and
@@ -713,12 +716,19 @@ def _expose_google_thought_signatures(message: object) -> None:
 
     :param message: A chunk ``delta`` or completion ``message`` whose
         ``tool_calls`` may carry the gateway's signature as an extra field.
+    :param call_ids: Replacement ids by tool index for one streamed choice.
     """
     for tool_call in getattr(message, "tool_calls", None) or []:
         function = getattr(tool_call, "function", None)
         call_id = getattr(tool_call, "id", None)
-        if call_id and call_id == getattr(function, "name", None):
-            object.__setattr__(tool_call, "id", f"call_{uuid.uuid4().hex[:24]}")
+        index = getattr(tool_call, "index", None)
+        if call_id and call_ids is not None and index in call_ids:
+            object.__setattr__(tool_call, "id", call_ids[index])
+        elif call_id and call_id == getattr(function, "name", None):
+            replacement = f"call_{uuid.uuid4().hex[:24]}"
+            object.__setattr__(tool_call, "id", replacement)
+            if call_ids is not None and index is not None:
+                call_ids[index] = replacement
         extras = getattr(tool_call, "model_extra", None) or {}
         signature = extras.get("thoughtSignature")
         if signature and not getattr(tool_call, "extra_content", None):
@@ -1004,11 +1014,16 @@ class _ReasoningBlockFilterStream:
         from ``AsyncOpenAI.chat.completions.create(stream=True)``.
     """
 
-    def __init__(self, stream: Any) -> None:  # type: ignore[explicit-any]
+    def __init__(  # type: ignore[explicit-any]
+        self, stream: Any, *, databricks_gateway: bool = False
+    ) -> None:
         """
         :param stream: Underlying async stream of chat completion chunks.
+        :param databricks_gateway: Adapt gateway tool signatures and ids.
         """
         self._stream = stream
+        self._databricks_gateway = databricks_gateway
+        self._tool_call_ids: dict[int, dict[int, str]] = {}
 
     def __aiter__(self) -> _ReasoningBlockFilterStream:
         return self
@@ -1021,7 +1036,10 @@ class _ReasoningBlockFilterStream:
         """
         chunk = await self._stream.__anext__()
         for choice in chunk.choices:
-            _expose_google_thought_signatures(choice.delta)
+            if self._databricks_gateway:
+                _expose_google_thought_signatures(
+                    choice.delta, self._tool_call_ids.setdefault(choice.index, {})
+                )
             if isinstance(getattr(choice.delta, "content", None), list):
                 # Bypass Pydantic's __setattr__ validation — the field type
                 # in ChoiceDelta is ``str | None`` and the list value from
@@ -1050,10 +1068,14 @@ class _ReasoningBlockFilterCompletions:
     reaches ``ChatCmplStreamHandler``.
 
     :param completions: The real ``AsyncCompletions`` object.
+    :param databricks_gateway: Adapt gateway tool signatures and ids.
     """
 
-    def __init__(self, completions: Any) -> None:  # type: ignore[explicit-any]
+    def __init__(  # type: ignore[explicit-any]
+        self, completions: Any, *, databricks_gateway: bool = False
+    ) -> None:
         self._completions = completions
+        self._databricks_gateway = databricks_gateway
 
     async def create(self, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
         """
@@ -1064,13 +1086,14 @@ class _ReasoningBlockFilterCompletions:
         :returns: A :class:`_ReasoningBlockFilterStream` when ``stream=True``,
             otherwise the raw ``ChatCompletion`` response.
         """
-        if "messages" in kwargs:
+        if self._databricks_gateway and "messages" in kwargs:
             kwargs["messages"] = _gateway_thought_signature_messages(kwargs["messages"])
         result = await self._completions.create(**kwargs)
         if kwargs.get("stream") and hasattr(result, "__anext__"):
-            return _ReasoningBlockFilterStream(result)
-        for choice in getattr(result, "choices", None) or []:
-            _expose_google_thought_signatures(getattr(choice, "message", None))
+            return _ReasoningBlockFilterStream(result, databricks_gateway=self._databricks_gateway)
+        if self._databricks_gateway:
+            for choice in getattr(result, "choices", None) or []:
+                _expose_google_thought_signatures(getattr(choice, "message", None))
         return result
 
     def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
@@ -1081,12 +1104,15 @@ class _ReasoningBlockFilterChat:
     """Wraps ``AsyncChat`` to expose a :class:`_ReasoningBlockFilterCompletions`.
 
     :param chat: The real ``AsyncOpenAI.chat`` object.
+    :param databricks_gateway: Adapt gateway tool signatures and ids.
     """
 
-    def __init__(self, chat: Any) -> None:  # type: ignore[explicit-any]
+    def __init__(  # type: ignore[explicit-any]
+        self, chat: Any, *, databricks_gateway: bool = False
+    ) -> None:
         self._chat = chat
         self.completions: _ReasoningBlockFilterCompletions = _ReasoningBlockFilterCompletions(
-            chat.completions
+            chat.completions, databricks_gateway=databricks_gateway
         )
 
     def __getattr__(self, name: str) -> Any:  # type: ignore[explicit-any]
@@ -1109,7 +1135,13 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     # every ``client.chat.completions.create()`` call the SDK makes.
     # ``object.__setattr__`` bypasses both the OpenAI SDK's own ``__setattr__``
     # and any Pydantic frozen-instance guard on the client class.
-    object.__setattr__(client, "chat", _ReasoningBlockFilterChat(client.chat))
+    object.__setattr__(
+        client,
+        "chat",
+        _ReasoningBlockFilterChat(
+            client.chat, databricks_gateway=_is_databricks_openai_client(client)
+        ),
+    )
     return client
 
 

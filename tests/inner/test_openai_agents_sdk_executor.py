@@ -3830,6 +3830,35 @@ def test_gateway_base_url_routes_only_gemini_to_mlflow(
     assert _gateway_base_url_for_model(gateway_url, model) == expected
 
 
+@pytest.mark.parametrize("credentials", ["api-key-override", "api-key-env", "env-only"])
+@pytest.mark.parametrize("surface", ["codex", "openai"])
+def test_get_openai_client_routes_gemini_with_api_keys(
+    monkeypatch, credentials: str, surface: str
+) -> None:
+    """Gateway routing works for both explicit API keys and environment auth."""
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    base_url = f"https://workspace.example.com/ai-gateway/{surface}/v1"
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", base_url)
+    kwargs: dict[str, str] = {"model": "system.ai.gemini-3-8-flash"}
+    if credentials != "env-only":
+        kwargs["api_key"] = "explicit-key"
+    if credentials == "api-key-override":
+        kwargs["base_url_override"] = base_url
+        monkeypatch.setenv("OPENAI_BASE_URL", "https://wrong.example.com/v1")
+
+    client = _get_openai_async_client(**kwargs)
+    try:
+        assert str(client.base_url).rstrip("/") == (
+            "https://workspace.example.com/ai-gateway/mlflow/v1"
+        )
+        assert client.api_key == ("env-key" if credentials == "env-only" else "explicit-key")
+    finally:
+        _run(client.close())
+
+
 def test_gateway_thought_signature_messages_moves_google_field() -> None:
     """The SDK's Google signature becomes the gateway's ``thoughtSignature``."""
     from omnigent.inner.openai_agents_sdk_executor import _gateway_thought_signature_messages
@@ -3855,37 +3884,55 @@ def test_gateway_thought_signature_messages_moves_google_field() -> None:
     assert "extra_content" in signed, "caller's message must not be mutated"
 
 
-def test_reasoning_filter_relays_gemini_thought_signatures() -> None:
-    """``create`` rewrites outgoing signatures and exposes incoming ones to the SDK."""
-    from openai.types.chat import ChatCompletionChunk
+@pytest.mark.parametrize("streaming", [True, False])
+@pytest.mark.parametrize(
+    "client_url",
+    [
+        "https://workspace.example.com/ai-gateway/mlflow/v1",
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        "https://openrouter.ai/api/v1",
+    ],
+)
+def test_reasoning_filter_relays_only_gateway_thought_signatures(
+    client_url: str, streaming: bool
+) -> None:
+    """Gateway adaptation preserves other providers' Google signature protocol."""
+    from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
-    from omnigent.inner.openai_agents_sdk_executor import _ReasoningBlockFilterCompletions
-
-    chunk = ChatCompletionChunk.model_validate(
-        {
-            "id": "c1",
-            "object": "chat.completion.chunk",
-            "created": 0,
-            "model": "gemini-3.8-flash",
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "index": 0,
-                                "id": "get_weather",
-                                "type": "function",
-                                "thoughtSignature": "sig-2",
-                                "function": {"name": "get_weather", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                }
-            ],
-        }
+    gateway = "/ai-gateway/" in client_url
+    incoming_signature = (
+        {"thoughtSignature": "sig-2"}
+        if gateway
+        else {"extra_content": {"google": {"thought_signature": "sig-2"}}}
     )
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "get_weather",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{}"},
+                **incoming_signature,
+            }
+        ],
+    }
+    payload = {
+        "id": "c1",
+        "object": "chat.completion.chunk" if streaming else "chat.completion",
+        "created": 0,
+        "model": "gemini-3.8-flash",
+        "choices": [
+            {
+                "index": 0,
+                "delta" if streaming else "message": message,
+                "finish_reason": "tool_calls",
+            }
+        ],
+    }
+    result_type = ChatCompletionChunk if streaming else ChatCompletion
+    response = result_type.model_validate(payload)
     captured: dict[str, Any] = {}
 
     class _Completions:
@@ -3893,9 +3940,9 @@ def test_reasoning_filter_relays_gemini_thought_signatures() -> None:
             captured.update(kwargs)
 
             async def _stream():
-                yield chunk
+                yield response
 
-            return _stream()
+            return _stream() if streaming else response
 
     outgoing = [
         {
@@ -3911,17 +3958,32 @@ def test_reasoning_filter_relays_gemini_thought_signatures() -> None:
         }
     ]
 
-    async def _run_inner() -> list[Any]:
-        stream = await _ReasoningBlockFilterCompletions(_Completions()).create(
-            model="system.ai.gemini-3-8-flash", messages=outgoing, stream=True
+    client = types.SimpleNamespace(
+        base_url=client_url, chat=types.SimpleNamespace(completions=_Completions())
+    )
+    _wrap_client_for_reasoning_models(client)
+
+    async def _run_inner() -> Any:
+        result = await client.chat.completions.create(
+            model="gemini-3.8-flash", messages=outgoing, stream=streaming
         )
-        return [c async for c in stream]
+        if streaming:
+            return (await anext(result)).choices[0].delta
+        return result.choices[0].message
 
-    chunks = _run(_run_inner())
+    incoming = _run(_run_inner()).tool_calls[0]
+    sent_call = captured["messages"][0]["tool_calls"][0]
 
-    assert captured["messages"][0]["tool_calls"][0]["thoughtSignature"] == "sig-1"
-    tool_call = chunks[0].choices[0].delta.tool_calls[0]
-    assert tool_call.extra_content == {"google": {"thought_signature": "sig-2"}}
+    if gateway:
+        assert sent_call["thoughtSignature"] == "sig-1"
+        assert "extra_content" not in sent_call
+        assert incoming.id.startswith("call_")
+    else:
+        assert sent_call["extra_content"] == {"google": {"thought_signature": "sig-1"}}
+        assert "thoughtSignature" not in sent_call
+        assert incoming.id == "get_weather"
+    assert incoming.extra_content == {"google": {"thought_signature": "sig-2"}}
+    assert "extra_content" in outgoing[0]["tool_calls"][0]
 
 
 def test_expose_google_thought_signatures_uniquifies_name_ids() -> None:
@@ -3952,3 +4014,65 @@ def test_expose_google_thought_signatures_uniquifies_name_ids() -> None:
     assert first_id != "sys_os_read" and first_id.startswith("call_")
     assert first_id != second.tool_calls[0].id
     assert distinct.tool_calls[0].id == "call_abc"
+
+
+def test_gateway_stream_preserves_call_ids_across_deltas() -> None:
+    """Repeated gateway ids must match in the SDK's added and completed tool events."""
+    from agents.models.chatcmpl_stream_handler import ChatCmplStreamHandler
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.responses import Response
+
+    async def _source():
+        for arguments in ('{"path":"', 'alpha"}'):
+            yield ChatCompletionChunk.model_validate(
+                {
+                    "id": "c1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "gemini-3.8-flash",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": index,
+                                        "id": "sys_os_read",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "sys_os_read",
+                                            "arguments": arguments,
+                                        },
+                                    }
+                                    for index in (0, 1)
+                                ]
+                            },
+                        }
+                    ],
+                }
+            )
+
+    async def _events():
+        stream = _ReasoningBlockFilterStream(_source(), databricks_gateway=True)
+        return [
+            event
+            async for event in ChatCmplStreamHandler.handle_stream(
+                Response.model_construct(id="response", output=[]),
+                stream,
+                model="gemini-3.8-flash",
+            )
+        ]
+
+    previous_ids: set[str] = set()
+    for _ in range(2):
+        events = _run(_events())
+        started = [
+            event.item.call_id for event in events if event.type == "response.output_item.added"
+        ]
+        done = [
+            event.item.call_id for event in events if event.type == "response.output_item.done"
+        ]
+        assert started == done
+        assert len(set(done)) == 2
+        assert not previous_ids.intersection(done)
+        previous_ids.update(done)

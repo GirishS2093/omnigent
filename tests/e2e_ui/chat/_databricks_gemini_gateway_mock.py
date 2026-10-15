@@ -119,8 +119,11 @@ class GeminiGatewayMock:
             self._server = None
 
     def dump(self, path: str) -> None:
+        # Handler threads may still be appending (loop/timeout outcomes).
+        with self._lock:
+            snapshot = list(self.journal)
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump(self.journal, handle, indent=2, default=str)
+            json.dump(snapshot, handle, indent=2, default=str)
 
     def decisions(self) -> list[str]:
         with self._lock:

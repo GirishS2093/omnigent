@@ -27,12 +27,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from omnigent.runner.identity import token_bound_runner_id
@@ -96,7 +97,12 @@ class GatewayHome:
     runner_id: str
 
     def profile(self, variant: str) -> str:
-        return f"omni-gemini-{variant}"
+        return _profile_name(variant)
+
+
+def _profile_name(variant: str) -> str:
+    """The ``~/.databrickscfg`` profile that points a variant at its mock gateway."""
+    return f"omni-gemini-{variant}"
 
 
 @dataclass
@@ -184,7 +190,7 @@ def gateway_home(
         mock = GeminiGatewayMock(files=dict(FILES), enforce_thought_signature=enforce)
         origin = mock.start()
         mocks[variant] = mock
-        profiles[f"omni-gemini-{variant}"] = (origin, f"{origin}/ai-gateway/{surface}")
+        profiles[_profile_name(variant)] = (origin, f"{origin}/ai-gateway/{surface}")
     write_gateway_home(home, profiles)
     try:
         runner, runner_id = _spawn_runner(live_server, home, home / "runner.log")
@@ -212,7 +218,10 @@ def _gemini_session(base_url: str, gateway: GatewayHome, variant: str) -> Iterat
     try:
         yield session_id
     finally:
-        httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        # Best-effort cleanup: after a hard failure the server may be gone, and
+        # an error here would mask the test's own failure.
+        with suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
 
 
 def _send(page: Page, text: str) -> None:
@@ -231,7 +240,12 @@ def _error_text(page: Page) -> str | None:
     text = headline.inner_text() if headline.count() else first.inner_text()
     content = first.get_by_test_id("error-message-content")
     if content.count() == 0 and headline.count():
-        headline.click()
+        # Short, guarded click: this runs inside the outcome poll loop, where
+        # Playwright's 30 s default would stall it on a detached headline.
+        try:
+            headline.click(timeout=2_000)
+        except PlaywrightError:
+            return text
         page.wait_for_timeout(300)
         content = first.get_by_test_id("error-message-content")
     if content.count():
@@ -269,7 +283,11 @@ def _wait_for_outcome(page: Page, mock: GeminiGatewayMock) -> Outcome:
 def _dump_ui_state(
     page: Page, base_url: str, session_id: str, outcome: Outcome, path: Path
 ) -> None:
-    items = httpx.get(f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0).json()
+    # Diagnostics only: a failed fetch must not replace the outcome assertion.
+    try:
+        items = httpx.get(f"{base_url}/v1/sessions/{session_id}/items", timeout=10.0).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        items = {"data": [], "fetch_error": repr(exc)}
     rows = items.get("data", items) if isinstance(items, dict) else items
     kinds: dict[str, int] = {}
     for row in rows:

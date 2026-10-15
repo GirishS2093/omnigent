@@ -53,12 +53,19 @@ _WSL_UNAME = (
 
 # Stand-in for the WSL launcher: runs the command through the real bash so
 # the product's ``--noprofile --norc -c`` argv works, but answers ``uname``
-# the way a WSL distro would and keeps ``$0`` pointing at itself.
+# the way a WSL distro would and keeps ``$0`` pointing at itself. The real
+# bash is found by absolute path, not on PATH: the stand-in's own directory is
+# first on PATH, so a bare ``bash`` would re-run the stand-in. Both locations
+# are tried for hosts without usr-merge.
 _LAUNCHER = """\
 #!/bin/bash
 standin_dir=$(cd "$(dirname "$0")" && pwd)
 export PATH="$standin_dir/wsl-bin:$PATH"
-exec -a "$0" /usr/bin/bash "$@"
+for real_bash in /usr/bin/bash /bin/bash; do
+  [ -x "$real_bash" ] && exec -a "$0" "$real_bash" "$@"
+done
+echo "launcher stand-in: no bash at /usr/bin/bash or /bin/bash" >&2
+exit 127
 """
 _UNAME = f'#!/bin/sh\necho "{_WSL_UNAME}"\n'
 

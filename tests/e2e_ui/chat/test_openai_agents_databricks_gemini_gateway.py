@@ -101,7 +101,7 @@ class GatewayHome:
 
 
 def _profile_name(variant: str) -> str:
-    """The ``~/.databrickscfg`` profile that points a variant at its mock gateway."""
+    """The Databricks CLI profile name that points a variant at its mock gateway."""
     return f"omni-gemini-{variant}"
 
 

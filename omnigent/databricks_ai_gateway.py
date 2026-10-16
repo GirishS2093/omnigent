@@ -102,7 +102,11 @@ MODEL_PROVIDER_SERVICE_HEADER: Final = "Databricks-Model-Provider-Service"
 MODEL_PROVIDER_SERVICE_ENV_VAR: Final = "HARNESS_DATABRICKS_MODEL_PROVIDER_SERVICE"
 
 # Harnesses that send the provider-service header on their gateway requests.
-MODEL_PROVIDER_SERVICE_HARNESSES: Final = frozenset({"claude-sdk", "openai-agents"})
+MODEL_PROVIDER_SERVICE_HARNESSES: Final = frozenset({"antigravity", "claude-sdk", "openai-agents"})
+
+# Unity Gateway's native Gemini API route on a workspace host; the Gemini SDKs
+# append ``/v1beta/models/<model>:generateContent`` to it.
+GEMINI_GATEWAY_PATH: Final = "/ai-gateway/gemini"
 
 # Prefixes the Databricks catalog puts on the models it serves itself.
 _DATABRICKS_MODEL_PREFIXES: Final = ("databricks/", "system.ai.", "databricks-")

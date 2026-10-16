@@ -111,7 +111,8 @@ Omnigent sends the `Databricks-Model-Provider-Service` header on every gateway
 request. Match the harness to the model's API type on the provider page:
 `claude-sdk` for `anthropic/v1/messages`, `openai-agents` for
 `openai/v1/responses` (add `use_responses: false` for chat-completions-only
-models). Other harnesses reject the setting. A Databricks-hosted model override
+models), `antigravity` for `gemini/v1/generateContent` (see below). Other
+harnesses reject the setting. A Databricks-hosted model override
 (e.g. `databricks-claude-sonnet-5` from `/model` or a sub-agent dispatch) is
 ignored for such an agent, which keeps its provider model, and background
 session titles use the agent's model rather than the economy-tier alias.
@@ -122,8 +123,7 @@ session titles use the agent's model rather than the economy-tier alias.
 [Antigravity SDK](https://pypi.org/project/google-antigravity/)
 (`pip install "omnigent[antigravity]"`). It defaults to **Gemini 3.5 Flash**
 and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
-Gemini API key, or Vertex AI (`project` / `location`) — the SDK is
-Gemini-native and has no OpenAI-compatible gateway / Databricks path.
+Gemini API key, Vertex AI (`project` / `location`), or Databricks.
 
 ```yaml
 executor:
@@ -133,6 +133,29 @@ executor:
     type: api_key
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
+
+With `auth: {type: databricks}`, every model call goes to Unity Gateway's native
+Gemini route (`<workspace>/ai-gateway/gemini`) under your Databricks login, with
+no Gemini key on the machine. Name a Gemini model provider service to reach it:
+
+```yaml
+executor:
+  type: omnigent
+  model: gemini-3.8-flash               # a model the provider service allows
+  auth:
+    type: databricks
+    profile: oss
+  config:
+    harness: antigravity
+    model_provider_service: main.ai.gemini_prod   # catalog.schema.service
+```
+
+Tokens come from the Databricks CLI (`databricks auth token`), so it must be
+installed and logged in. That command only serves OAuth logins; for a
+token-based (PAT) profile, Omnigent falls back to `databricks-sdk` when it is
+installed. The SDK sends fixed headers, so Omnigent restarts the
+agent with a fresh token (replaying the session history) before the current one
+expires.
 
 ### Pi context files
 
@@ -219,8 +242,8 @@ final prompt. This setting only supports `pi`, not `pi-native` or other harnesse
 `harness: copilot` runs the agent through the
 [GitHub Copilot SDK](https://pypi.org/project/github-copilot-sdk/)
 (`pip install "omnigent[copilot]"`). The SDK bundles the Copilot CLI it drives
-as a backing server, so no separate CLI install is needed. Like cursor and
-antigravity it talks only to GitHub's Copilot backend — there is no Databricks
+as a backing server, so no separate CLI install is needed. Like cursor it
+talks only to GitHub's Copilot backend — there is no Databricks
 gateway / `auth.type: databricks` path. Authenticate with a **GitHub token** that
 carries Copilot access: a fine-grained PAT with the "Copilot Requests"
 permission, or an OAuth token from the GitHub CLI (`gh auth token`) / Copilot

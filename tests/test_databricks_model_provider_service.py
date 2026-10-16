@@ -15,7 +15,7 @@ from omnigent.databricks_ai_gateway import (
     validate_model_provider_service,
 )
 from omnigent.inference_config import inference_config_scope
-from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec
 
 _BEDROCK = "main.ai.bedrock_prod"
 
@@ -127,6 +127,38 @@ def test_runner_spawn_env_carries_the_spec_provider_service() -> None:
     assert routed is not None and plain is not None
     assert routed[MODEL_PROVIDER_SERVICE_ENV_VAR] == _BEDROCK
     assert MODEL_PROVIDER_SERVICE_ENV_VAR not in plain
+
+
+def test_runner_spawn_env_carries_provider_service_for_antigravity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Databricks-routed antigravity agent sends the provider header too."""
+    from omnigent.runner.app import _build_spawn_env_from_spec
+    from omnigent.runtime import workflow
+
+    monkeypatch.setattr(
+        workflow,
+        "get_workspace_url_for_profile",
+        lambda profile: "https://example.cloud.databricks.com",
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="gemini-routed",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "antigravity", "model_provider_service": "main.ai.gemini_prod"},
+            model="gemini-3.8-flash",
+            auth=DatabricksAuth(profile="dev"),
+        ),
+    )
+    with inference_config_scope({}):
+        env = _build_spawn_env_from_spec(spec, "antigravity")
+
+    assert env is not None
+    assert env[MODEL_PROVIDER_SERVICE_ENV_VAR] == "main.ai.gemini_prod"
+    assert env["HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL"] == (
+        "https://example.cloud.databricks.com/ai-gateway/gemini"
+    )
 
 
 @pytest.mark.parametrize("harness", ["codex", "pi"])

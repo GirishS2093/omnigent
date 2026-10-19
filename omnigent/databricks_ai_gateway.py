@@ -152,3 +152,24 @@ def is_databricks_catalog_model(model: str) -> bool:
     :returns: ``True`` when *model* carries a Databricks catalog prefix.
     """
     return model.strip().lower().startswith(_DATABRICKS_MODEL_PREFIXES)
+
+
+def provider_pinned_override_ignored(provider_service: object, model_override: object) -> bool:
+    """Return whether a provider-pinned agent must ignore *model_override*.
+
+    An agent pinned to a model provider service keeps its own provider model: the
+    provider cannot serve a Databricks-hosted id, and sending one with the
+    provider header fails the turn (``NOT_FOUND`` / ``403``).
+
+    :param provider_service: The agent's ``executor.config.model_provider_service``,
+        e.g. ``"main.ai.bedrock_prod"``, or ``None``.
+    :param model_override: The session or dispatch model override, e.g.
+        ``"databricks-claude-opus-5"``, or ``None``.
+    :returns: ``True`` when both are set and the override is a Databricks-hosted id.
+    """
+    return (
+        bool(provider_service)
+        and isinstance(model_override, str)
+        and bool(model_override)
+        and is_databricks_catalog_model(model_override)
+    )

@@ -5021,6 +5021,16 @@ def create_runner_app(
         # the executor adapter into ExecutorConfig.model, which is how a native
         # terminal learns to switch models for this turn.
         _model_override = msg_body.get("model_override")
+        if cached_spec is not None:
+            from omnigent.databricks_ai_gateway import provider_pinned_override_ignored
+
+            # The spawn env already dropped this override (see
+            # _build_spawn_env_from_spec); the per-turn copy must go too, or the
+            # executor sends the Databricks-hosted id to the provider service.
+            if provider_pinned_override_ignored(
+                cached_spec.executor.config.get("model_provider_service"), _model_override
+            ):
+                _model_override = None
         if isinstance(_model_override, str) and _model_override:
             harness_body["model_override"] = _model_override
         # The web's stable id for this message: stamped on the turn's failure
@@ -8139,21 +8149,17 @@ def _build_spawn_env_from_spec(
     if model_override and env is not None:
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
-            if provider_service:
-                from omnigent.databricks_ai_gateway import is_databricks_catalog_model
+            from omnigent.databricks_ai_gateway import provider_pinned_override_ignored
 
-                if is_databricks_catalog_model(model_override):
-                    # An agent pinned to a provider service keeps its own provider
-                    # model: the provider cannot serve a Databricks-hosted id, and
-                    # sending one with its header fails the turn (``NOT_FOUND``).
-                    _logger.warning(
-                        "ignoring model override %s: agent is pinned to model provider "
-                        "service %s, which does not serve Databricks-hosted models",
-                        model_override,
-                        provider_service,
-                        extra={"session_id": session_id},
-                    )
-                    model_override = None
+            if provider_pinned_override_ignored(provider_service, model_override):
+                _logger.warning(
+                    "ignoring model override %s: agent is pinned to model provider "
+                    "service %s, which does not serve Databricks-hosted models",
+                    model_override,
+                    provider_service,
+                    extra={"session_id": session_id},
+                )
+                model_override = None
             if model_override:
                 env[model_key] = model_override
 

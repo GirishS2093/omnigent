@@ -1,21 +1,7 @@
-"""Local stand-in for the Databricks AI Gateway surfaces a hosted Gemini model uses.
+"""Strict gateway double: Gemini requires MLflow and signed tool history.
 
-Emulates only the gateway behaviors the openai-agents + Databricks Gemini report
-describes, so the harness can be driven end to end without a workspace:
-
-- ``/ai-gateway/codex/v1`` proxies GPT's Responses API only: ``chat/completions``
-  answers 400 ("doesn't match any known API type") and ``responses`` answers 400
-  ("Responses API passthrough is not supported for model ...").
-- ``/ai-gateway/mlflow/v1/chat/completions`` serves the Gemini model. Tool calls
-  come back with ``id`` equal to the function name and a top-level
-  ``thoughtSignature`` (also on stream deltas). When enforcement is on, a request
-  whose assistant ``tool_calls`` lack ``thoughtSignature`` is rejected with 400
-  ("Function call is missing a thought_signature in functionCall parts").
-
-The scripted model reads each configured file once (in order) as long as its
-marker is absent from the tool results in the request history, then answers.
-Every request is journaled for evidence. Error envelopes and the exact
-surrounding wording are inferred from the report, not from a real gateway.
+Calls reuse the function name as their ID; file results drive the next read.
+Requests are journaled. Error envelopes are inferred from the reported failure.
 """
 
 from __future__ import annotations
@@ -43,18 +29,9 @@ LOOP_GUARD = 40
 
 @dataclass
 class GeminiGatewayMock:
-    """One gateway origin.
-
-    :param files: Ordered ``path -> marker`` the scripted model reads; a marker
-        found in any tool result means that file is done.
-    :param enforce_thought_signature: Reject assistant tool calls without
-        ``thoughtSignature`` the way the real gateway does.
-    :param tool_name: Function the model calls to read a file.
-    """
+    """Read ordered path-to-marker files, requiring signed tool history."""
 
     files: dict[str, str]
-    enforce_thought_signature: bool = True
-    tool_name: str = "sys_os_read"
     journal: list[dict[str, Any]] = field(default_factory=list)
     _server: ThreadingHTTPServer | None = None
     _thread: threading.Thread | None = None
@@ -170,23 +147,22 @@ class GeminiGatewayMock:
         self, body: dict[str, Any], model: str
     ) -> tuple[int, dict[str, Any], str, str | None]:
         messages = body.get("messages") or []
-        if self.enforce_thought_signature:
-            for message in messages:
-                if message.get("role") != "assistant":
-                    continue
-                for call in message.get("tool_calls") or []:
-                    if not call.get("thoughtSignature"):
-                        return (
-                            400,
-                            _error(MISSING_SIGNATURE_ERROR),
-                            "missing thoughtSignature",
-                            None,
-                        )
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if not call.get("thoughtSignature"):
+                    return (
+                        400,
+                        _error(MISSING_SIGNATURE_ERROR),
+                        "missing thoughtSignature",
+                        None,
+                    )
         tools = {(tool.get("function") or {}).get("name") for tool in body.get("tools") or []}
-        if self.tool_name not in tools:
+        if "sys_os_read" not in tools:
             return (
                 500,
-                _error(f"mock setup: tool {self.tool_name!r} not advertised; got {sorted(tools)}"),
+                _error(f"mock setup: tool 'sys_os_read' not advertised; got {sorted(tools)}"),
                 "tool not advertised",
                 None,
             )
@@ -205,15 +181,15 @@ class GeminiGatewayMock:
         completion_id = f"chatcmpl-mock-{request_no}"
         if pending:
             tool_call = {
-                "id": self.tool_name,
+                "id": "sys_os_read",
                 "type": "function",
                 "function": {
-                    "name": self.tool_name,
+                    "name": "sys_os_read",
                     "arguments": json.dumps({"path": pending[0]}),
                 },
                 "thoughtSignature": f"thought-signature-{request_no}",
             }
-            note = f"tool call {self.tool_name}({pending[0]})"
+            note = f"tool call sys_os_read({pending[0]})"
             if stream:
                 return (
                     200,
@@ -259,39 +235,32 @@ class GeminiGatewayMock:
         )
 
 
-def write_gateway_home(home: Path, profiles: dict[str, tuple[str, str]]) -> None:
-    """Write the ``~/.databrickscfg`` profiles and ucode state a Databricks user would have.
-
-    :param home: Directory to use as ``HOME``.
-    :param profiles: ``profile -> (workspace origin, ucode codex base URL)``. Each
-        profile is a static-token entry for its origin; each origin gets a ucode
-        workspace whose ``codex`` agent carries *base URL* and a static auth command.
-    """
+def write_gateway_home(home: Path, profile: str, origin: str) -> None:
+    """Seed one scratch Databricks profile and ucode workspace on the codex surface."""
     home.mkdir(parents=True, exist_ok=True)
-    cfg_lines = []
-    workspaces: dict[str, Any] = {}
-    for profile, (origin, base_url) in profiles.items():
-        cfg_lines.append(f"[{profile}]\nhost = {origin}\ntoken = mock-pat-{profile}\n")
-        workspaces[origin] = {
-            "workspace": origin,
-            "codex_models": ["databricks-gpt-5-5"],
-            "base_urls": {"codex": f"{origin}/ai-gateway/codex/v1"},
-            "available_tools": ["codex"],
-            "agents": {
-                "codex": {
-                    "model": "databricks-gpt-5-5",
-                    "base_url": base_url,
-                    "auth_command": "printf omni-mock-token",
-                }
-            },
-        }
-    (home / ".databrickscfg").write_text("\n".join(cfg_lines), encoding="utf-8")
+    (home / ".databrickscfg").write_text(
+        f"[{profile}]\nhost = {origin}\ntoken = mock-pat-{profile}\n", encoding="utf-8"
+    )
     ucode_dir = home / ".ucode"
     ucode_dir.mkdir(exist_ok=True)
     state = {
         "state_version": 1,
-        "current_workspace": next(iter(workspaces), None),
-        "workspaces": workspaces,
+        "current_workspace": origin,
+        "workspaces": {
+            origin: {
+                "workspace": origin,
+                "codex_models": ["databricks-gpt-5-5"],
+                "base_urls": {"codex": f"{origin}/ai-gateway/codex/v1"},
+                "available_tools": ["codex"],
+                "agents": {
+                    "codex": {
+                        "model": "databricks-gpt-5-5",
+                        "base_url": f"{origin}/ai-gateway/codex/v1",
+                        "auth_command": "printf omni-mock-token",
+                    }
+                },
+            }
+        },
     }
     (ucode_dir / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 

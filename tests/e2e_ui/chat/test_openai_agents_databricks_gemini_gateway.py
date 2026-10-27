@@ -1,20 +1,7 @@
-"""UI journey: openai-agents reading two files on a Databricks-hosted Gemini model.
+"""Read two files through the browser, server, runner, and real OpenAI Agents SDK.
 
-The agent spec pins ``databricks-gemini-3-8-flash`` with
-``auth: {type: databricks, profile: <p>}`` and an ``os_env``; the user asks for two
-file reads in the web chat. A local stand-in for the Databricks AI Gateway serves the
-model (``_databricks_gemini_gateway_mock``), and ucode state supplies the gateway base
-URL exactly as ``configure_agent_harness_with_ucode`` reads it. Each variant points
-its profile at a differently configured gateway origin:
-
-- ``codex-surface``: ucode's codex base URL, which only proxies GPT Responses.
-- ``mlflow-surface``: base URL forced to ``/ai-gateway/mlflow/v1`` (serves Gemini).
-- ``mlflow-lenient``: the same surface without the thought-signature check, so the
-  tool loop caused by ``id == function name`` tool calls is reachable.
-
-The fake Databricks CLI profiles and ucode state live in a scratch ``HOME``
-that only a dedicated runner (spawned here against the shared server) sees, so the
-developer's own Databricks and ucode configuration is never read or written.
+An isolated HOME supplies a Databricks profile and ucode codex URL; the strict
+mock gateway requires Gemini to use MLflow and preserve tool thought signatures.
 """
 
 from __future__ import annotations
@@ -22,9 +9,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import signal
 import subprocess
-import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -37,6 +22,8 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
+from tests._helpers.live_server import isolated_process_env, terminate_process
 from tests.e2e_ui.chat._databricks_gemini_gateway_mock import (
     GeminiGatewayMock,
     write_gateway_home,
@@ -44,11 +31,11 @@ from tests.e2e_ui.chat._databricks_gemini_gateway_mock import (
 from tests.e2e_ui.conftest import (
     _HEALTH_POLL_INTERVAL_S,
     _HEALTH_TIMEOUT_S,
-    _REPO_ROOT,
     _create_bundled_session,
 )
 
 MODEL = "databricks-gemini-3-8-flash"
+PROFILE = "omni-gemini-codex-surface"
 FILES = {"notes/alpha.txt": "ALPHA-CONTENT-7f3a", "notes/bravo.txt": "BRAVO-CONTENT-9c1e"}
 PROMPT = (
     "Read notes/alpha.txt and notes/bravo.txt with your file tool and tell me what each one says."
@@ -58,15 +45,9 @@ _TURN_TIMEOUT_S = 120.0
 # A file requested this many times means the model never sees its earlier result.
 _LOOP_REPEATS = 3
 
-_VARIANTS: dict[str, tuple[str, bool]] = {
-    "codex-surface": ("codex/v1", True),
-    "mlflow-surface": ("mlflow/v1", True),
-    "mlflow-lenient": ("mlflow/v1", False),
-}
-
 _AGENT_YAML = """\
 spec_version: 1
-name: gemini_gateway_probe_{slug}
+name: gemini_gateway_probe
 prompt: |
   You are a file assistant. Use the sys_os_read tool to read each file the user
   names, one call per file, then tell the user what each file says.
@@ -89,20 +70,11 @@ os_env:
 
 @dataclass
 class GatewayHome:
-    """Scratch HOME, one mock gateway per variant, and the runner that uses them."""
+    """One attempt's workspace, mock gateway, and isolated runner."""
 
-    home: Path
     workspace: Path
-    mocks: dict[str, GeminiGatewayMock]
+    mock: GeminiGatewayMock
     runner_id: str
-
-    def profile(self, variant: str) -> str:
-        return _profile_name(variant)
-
-
-def _profile_name(variant: str) -> str:
-    """The Databricks CLI profile name that points a variant at its mock gateway."""
-    return f"omni-gemini-{variant}"
 
 
 @dataclass
@@ -111,107 +83,83 @@ class Outcome:
     detail: str
 
 
-def _terminate(proc: subprocess.Popen[bytes]) -> None:
-    if proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _spawn_runner(
-    base_url: str, home: Path, log_path: Path
-) -> tuple[subprocess.Popen[bytes], str]:
-    """Start a runner whose ``HOME`` is *home* and wait until the server sees it online.
-
-    Ambient Databricks/OpenAI credentials are dropped so the harness can only
-    authenticate through the scratch profile; a broken profile fails loudly instead
-    of silently falling back to a mock key.
-    """
+@contextmanager
+def _spawn_runner(base_url: str, home: Path, log_path: Path) -> Iterator[str]:
+    """Start the selected runner with only the scratch Databricks/OpenAI credentials."""
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
-    env = {
+    base_env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("DATABRICKS_", "OPENAI_"))
     }
-    env.update(
-        HOME=str(home),
-        PYTHONPATH=f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
-        OMNIGENT_RUNNER_ID=runner_id,
-        OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN=binding_token,
-        OMNIGENT_RUNNER_PARENT_PID=str(os.getpid()),
-        RUNNER_SERVER_URL=base_url,
+    env = isolated_process_env(
+        home,
+        {
+            "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
+            "OMNIGENT_RUNNER_ID": runner_id,
+            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+            "RUNNER_SERVER_URL": base_url,
+        },
+        base_env,
     )
     with open(log_path, "w") as log_handle:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=env,
+            [runner_executable(), "-m", "omnigent.runner._entry"],
+            env=apply_runner_env(env),
+            cwd=compat_runner_cwd(),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(
-                f"gateway runner exited early (code {proc.returncode}); log:\n"
-                f"{log_path.read_text()[-3000:]}"
-            )
-        try:
-            status = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
-            if status.status_code == 200 and status.json().get("online") is True:
-                return proc, runner_id
-        except httpx.HTTPError:
-            pass
-        time.sleep(_HEALTH_POLL_INTERVAL_S)
-    _terminate(proc)
-    raise RuntimeError(
-        f"gateway runner did not come online within {_HEALTH_TIMEOUT_S:.0f}s; log:\n"
-        f"{log_path.read_text()[-3000:]}"
-    )
+    try:
+        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"gateway runner exited early (code {proc.returncode}); log:\n"
+                    f"{log_path.read_text()[-3000:]}"
+                )
+            try:
+                status = httpx.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2)
+            except httpx.HTTPError:
+                pass
+            else:
+                if status.status_code == 200 and status.json().get("online") is True:
+                    yield runner_id
+                    return
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"gateway runner did not come online within {_HEALTH_TIMEOUT_S:.0f}s; log:\n"
+            f"{log_path.read_text()[-3000:]}"
+        )
+    finally:
+        terminate_process(proc)
 
 
-@pytest.fixture(scope="session")
-def gateway_home(
-    live_server: str, tmp_path_factory: pytest.TempPathFactory
-) -> Iterator[GatewayHome]:
-    home = tmp_path_factory.mktemp("gemini_gateway_home")
+@pytest.fixture
+def gateway_home(live_server: str, tmp_path: Path) -> Iterator[GatewayHome]:
+    home = tmp_path / "home"
     workspace = home / "workspace"
     for rel, marker in FILES.items():
         target = workspace / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(f"{marker}\nfixture file for the two-file read journey\n")
-    mocks: dict[str, GeminiGatewayMock] = {}
-    profiles: dict[str, tuple[str, str]] = {}
-    for variant, (surface, enforce) in _VARIANTS.items():
-        mock = GeminiGatewayMock(files=dict(FILES), enforce_thought_signature=enforce)
-        origin = mock.start()
-        mocks[variant] = mock
-        profiles[_profile_name(variant)] = (origin, f"{origin}/ai-gateway/{surface}")
-    write_gateway_home(home, profiles)
+    mock = GeminiGatewayMock(files=FILES)
+    origin = mock.start()
     try:
-        runner, runner_id = _spawn_runner(live_server, home, home / "runner.log")
-    except Exception:
-        for mock in mocks.values():
-            mock.stop()
-        raise
-    try:
-        yield GatewayHome(home=home, workspace=workspace, mocks=mocks, runner_id=runner_id)
+        write_gateway_home(home, PROFILE, origin)
+        with _spawn_runner(live_server, home, home / "runner.log") as runner_id:
+            yield GatewayHome(workspace=workspace, mock=mock, runner_id=runner_id)
     finally:
-        _terminate(runner)
-        for mock in mocks.values():
-            mock.stop()
+        mock.stop()
 
 
 @contextmanager
-def _gemini_session(base_url: str, gateway: GatewayHome, variant: str) -> Iterator[str]:
+def _gemini_session(base_url: str, gateway: GatewayHome) -> Iterator[str]:
     yaml_text = _AGENT_YAML.format(
-        slug=variant.replace("-", "_"),
         model=MODEL,
-        profile=gateway.profile(variant),
+        profile=PROFILE,
         workspace=gateway.workspace,
     )
     session_id = _create_bundled_session(
@@ -319,36 +267,57 @@ def _evidence(mock: GeminiGatewayMock) -> str:
 
 
 @pytest.mark.timeout(420)
-@pytest.mark.parametrize("variant", list(_VARIANTS))
 def test_databricks_gemini_two_file_read_completes(
     page: Page,
     live_server: str,
     gateway_home: GatewayHome,
     tmp_path: Path,
-    variant: str,
 ) -> None:
-    """Both files are read once each and the assistant answers, on every gateway variant."""
-    mock = gateway_home.mocks[variant]
-    with _gemini_session(live_server, gateway_home, variant) as session_id:
+    """The codex URL resolves to MLflow; signed, distinct reads produce the browser answer."""
+    mock = gateway_home.mock
+    with _gemini_session(live_server, gateway_home) as session_id:
         page.goto(f"{live_server}/c/{session_id}")
         _send(page, PROMPT)
         outcome = _wait_for_outcome(page, mock)
         page.wait_for_timeout(3_000)
-        page.screenshot(path=str(tmp_path / f"{variant}-outcome.png"), full_page=True)
-        mock.dump(str(tmp_path / f"{variant}-gateway-journal.json"))
+        page.screenshot(path=str(tmp_path / "codex-surface-outcome.png"), full_page=True)
+        mock.dump(str(tmp_path / "codex-surface-gateway-journal.json"))
         _dump_ui_state(
-            page, live_server, session_id, outcome, tmp_path / f"{variant}-ui-state.json"
+            page, live_server, session_id, outcome, tmp_path / "codex-surface-ui-state.json"
         )
 
-    assert outcome.kind == "answer", (
-        f"[{variant}] turn ended with {outcome.kind}: {outcome.detail}\n"
-        f"gateway journal:\n{_evidence(mock)}"
-    )
+        assert outcome.kind == "answer", (
+            f"turn ended with {outcome.kind}: {outcome.detail}\n"
+            f"gateway journal:\n{_evidence(mock)}"
+        )
+        for path, marker in FILES.items():
+            expect(page.get_by_text(f"{path} says {marker}", exact=False)).to_be_visible()
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
+
     assert mock.decisions() == [*FILES, "<answer>"], (
-        f"[{variant}] model saw an unexpected call sequence: {mock.decisions()}"
+        f"model saw an unexpected call sequence: {mock.decisions()}"
     )
     paths = {entry["path"] for entry in mock.journal}
     assert paths == {"/ai-gateway/mlflow/v1/chat/completions"}, (
-        f"[{variant}] requests reached surfaces that do not serve Gemini: {sorted(paths)}"
+        f"requests reached surfaces that do not serve Gemini: {sorted(paths)}"
     )
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=30_000)
+    messages = mock.journal[-1]["body"]["messages"]
+    calls = [
+        call
+        for message in messages
+        if message["role"] == "assistant"
+        for call in message.get("tool_calls") or []
+    ]
+    assert [call["function"]["name"] for call in calls] == ["sys_os_read", "sys_os_read"]
+    assert [json.loads(call["function"]["arguments"])["path"] for call in calls] == list(FILES)
+    call_ids = [call["id"] for call in calls]
+    assert len(set(call_ids)) == 2
+    assert all(call_ids) and "sys_os_read" not in call_ids
+    assert [call["thoughtSignature"] for call in calls] == [
+        "thought-signature-1",
+        "thought-signature-2",
+    ]
+    results = [message for message in messages if message["role"] == "tool"]
+    assert [result["tool_call_id"] for result in results] == call_ids
+    for result, marker in zip(results, FILES.values(), strict=True):
+        assert marker in json.dumps(result["content"])

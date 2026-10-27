@@ -3810,6 +3810,11 @@ def test_shell_command_bearer_auth_reports_failed_command(caplog):
             "https://ws.example.com/ai-gateway/mlflow/v1",
         ),
         (
+            "https://ws.example.com/ai-gateway/mlflow/v1/",
+            "system.ai.gemini-3-8-flash",
+            "https://ws.example.com/ai-gateway/mlflow/v1/",
+        ),
+        (
             "https://ws.example.com/ai-gateway/codex/v1",
             "databricks-gpt-6-astra",
             "https://ws.example.com/ai-gateway/codex/v1",
@@ -3864,8 +3869,9 @@ def test_get_openai_client_routes_gemini_with_api_keys(
     [
         ("dev", "system.ai.gemini-3-8-flash"),
         (None, "databricks-gemini-3-8-flash"),
+        (None, "system.ai.gemini-3-8-flash"),
     ],
-    ids=["profile", "ambient-databricks"],
+    ids=["profile", "ambient-databricks", "ambient-unity-catalog"],
 )
 def test_get_openai_client_routes_gemini_with_databricks_auth(
     monkeypatch, profile: str | None, model: str

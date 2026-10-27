@@ -3859,6 +3859,42 @@ def test_get_openai_client_routes_gemini_with_api_keys(
         _run(client.close())
 
 
+@pytest.mark.parametrize(
+    ("profile", "model"),
+    [
+        ("dev", "system.ai.gemini-3-8-flash"),
+        (None, "databricks-gemini-3-8-flash"),
+    ],
+    ids=["profile", "ambient-databricks"],
+)
+def test_get_openai_client_routes_gemini_with_databricks_auth(
+    monkeypatch, profile: str | None, model: str
+) -> None:
+    """Profile and ambient Databricks auth both send Gemini to the MLflow surface."""
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    calls: list[str | None] = []
+
+    def _fake_resolve(profile=None, **kwargs):
+        calls.append(profile)
+        return httpx.BasicAuth("token", ""), "https://example.databricks.com"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    client = _get_openai_async_client(profile=profile, model=model)
+    try:
+        assert calls == [profile]
+        assert str(client.base_url).rstrip("/") == (
+            "https://example.databricks.com/ai-gateway/mlflow/v1"
+        )
+    finally:
+        _run(client.close())
+
+
 def test_gateway_thought_signature_messages_moves_google_field() -> None:
     """The SDK's Google signature becomes the gateway's ``thoughtSignature``."""
     from omnigent.inner.openai_agents_sdk_executor import _gateway_thought_signature_messages

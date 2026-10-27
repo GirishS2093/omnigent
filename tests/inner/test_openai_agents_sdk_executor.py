@@ -4112,3 +4112,75 @@ def test_gateway_stream_preserves_call_ids_across_deltas() -> None:
         assert len(set(done)) == 2
         assert not previous_ids.intersection(done)
         previous_ids.update(done)
+
+
+def test_gateway_stream_replaces_name_ids_that_precede_the_name() -> None:
+    """A name-shaped id streamed before its function name is still made unique."""
+    from agents.models.chatcmpl_stream_handler import ChatCmplStreamHandler
+    from openai.types.chat import ChatCompletionChunk
+    from openai.types.responses import Response
+
+    def _chunk(tool_calls: list[dict[str, Any]]) -> ChatCompletionChunk:
+        return ChatCompletionChunk.model_validate(
+            {
+                "id": "c1",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "gemini-3.8-flash",
+                "choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}],
+            }
+        )
+
+    async def _source():
+        # Index 0/1 repeat the tool name as their id; index 2 has a real id.
+        yield _chunk(
+            [
+                {
+                    "index": 0,
+                    "id": "sys_os_read",
+                    "type": "function",
+                    "function": {"arguments": ""},
+                },
+                {
+                    "index": 1,
+                    "id": "sys_os_read",
+                    "type": "function",
+                    "function": {"arguments": ""},
+                },
+                {"index": 2, "id": "call_real", "type": "function", "function": {"arguments": ""}},
+            ]
+        )
+        yield _chunk(
+            [
+                {"index": index, "function": {"name": "sys_os_read", "arguments": "{}"}}
+                for index in (0, 1, 2)
+            ]
+        )
+
+    async def _events():
+        stream = _ReasoningBlockFilterStream(_source(), databricks_gateway=True)
+        return [
+            event
+            async for event in ChatCmplStreamHandler.handle_stream(
+                Response.model_construct(id="response", output=[]),
+                stream,
+                model="gemini-3.8-flash",
+            )
+        ]
+
+    previous_ids: set[str] = set()
+    for _ in range(2):
+        events = _run(_events())
+        started = [
+            event.item.call_id for event in events if event.type == "response.output_item.added"
+        ]
+        done = [
+            event.item.call_id for event in events if event.type == "response.output_item.done"
+        ]
+        assert started == done
+        assert len(done) == 3
+        assert done[2] == "call_real"
+        assert "sys_os_read" not in done
+        assert len(set(done)) == 3
+        assert not previous_ids.intersection(done[:2])
+        previous_ids.update(done[:2])

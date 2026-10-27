@@ -705,7 +705,9 @@ def _gateway_thought_signature_messages(messages: object) -> object:
 
 
 def _expose_google_thought_signatures(
-    message: object, call_ids: dict[int, str] | None = None
+    message: object,
+    call_ids: dict[int, str] | None = None,
+    unnamed_ids: dict[int, str] | None = None,
 ) -> None:
     """Adapt gateway Gemini tool calls for the Agents SDK, in place.
 
@@ -717,18 +719,32 @@ def _expose_google_thought_signatures(
     :param message: A chunk ``delta`` or completion ``message`` whose
         ``tool_calls`` may carry the gateway's signature as an extra field.
     :param call_ids: Replacement ids by tool index for one streamed choice.
+    :param unnamed_ids: Gateway ids by tool index for one streamed choice whose
+        function name has not arrived yet.
     """
     for tool_call in getattr(message, "tool_calls", None) or []:
         function = getattr(tool_call, "function", None)
+        name = getattr(function, "name", None)
         call_id = getattr(tool_call, "id", None)
         index = getattr(tool_call, "index", None)
-        if call_id and call_ids is not None and index in call_ids:
-            object.__setattr__(tool_call, "id", call_ids[index])
-        elif call_id and call_id == getattr(function, "name", None):
+        if call_ids is not None and index in call_ids:
+            if call_id:
+                object.__setattr__(tool_call, "id", call_ids[index])
+        elif (call_id and call_id == name) or (
+            # A streamed id may precede its name; the SDK adopts the id carried
+            # by the name's delta before it announces the call.
+            not call_id
+            and name
+            and index is not None
+            and unnamed_ids is not None
+            and unnamed_ids.get(index) == name
+        ):
             replacement = f"call_{uuid.uuid4().hex[:24]}"
             object.__setattr__(tool_call, "id", replacement)
             if call_ids is not None and index is not None:
                 call_ids[index] = replacement
+        elif call_id and not name and unnamed_ids is not None and index is not None:
+            unnamed_ids[index] = call_id
         extras = getattr(tool_call, "model_extra", None) or {}
         signature = extras.get("thoughtSignature")
         if signature and not getattr(tool_call, "extra_content", None):
@@ -1024,6 +1040,7 @@ class _ReasoningBlockFilterStream:
         self._stream = stream
         self._databricks_gateway = databricks_gateway
         self._tool_call_ids: dict[int, dict[int, str]] = {}
+        self._unnamed_tool_call_ids: dict[int, dict[int, str]] = {}
 
     def __aiter__(self) -> _ReasoningBlockFilterStream:
         return self
@@ -1038,7 +1055,9 @@ class _ReasoningBlockFilterStream:
         for choice in chunk.choices:
             if self._databricks_gateway:
                 _expose_google_thought_signatures(
-                    choice.delta, self._tool_call_ids.setdefault(choice.index, {})
+                    choice.delta,
+                    self._tool_call_ids.setdefault(choice.index, {}),
+                    self._unnamed_tool_call_ids.setdefault(choice.index, {}),
                 )
             if isinstance(getattr(choice.delta, "content", None), list):
                 # Bypass Pydantic's __setattr__ validation — the field type

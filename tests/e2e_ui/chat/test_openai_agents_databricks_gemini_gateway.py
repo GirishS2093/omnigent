@@ -214,7 +214,9 @@ def _gemini_session(base_url: str, gateway: GatewayHome, variant: str) -> Iterat
         profile=gateway.profile(variant),
         workspace=gateway.workspace,
     )
-    session_id = _create_bundled_session(base_url, gateway.runner_id, yaml_text)
+    session_id = _create_bundled_session(
+        base_url, gateway.runner_id, yaml_text, operator_authored=True
+    )
     try:
         yield session_id
     finally:
